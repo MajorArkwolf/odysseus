@@ -50,7 +50,8 @@
           virtualisation.docker.enable = true;
           virtualisation.oci-containers.backend = "docker";
 
-          # Bind-mount dirs (searxng settings.yml comes from the repo checkout).
+          # Persistent bind-mount dirs for the odysseus container. (searxng's
+          # settings.yml template is mounted from the Nix store, not from here.)
           systemd.tmpfiles.rules = [
             "d ${cfg.basePath}                  0755 ${toString cfg.puid} ${toString cfg.pgid} - -"
             "d ${cfg.basePath}/data             0755 ${toString cfg.puid} ${toString cfg.pgid} - -"
@@ -120,13 +121,54 @@
             };
 
             searxng = {
-              image = "searxng/searxng:latest";
+              # Pinned, not :latest — upstream `latest`/2026.6.2 crashes on boot
+              # with `KeyError: 'default_doi_resolver'` (issue #1414). Bump this
+              # deliberately after verifying a newer tag boots clean. Mirrors
+              # docker-compose.yml.
+              image = "searxng/searxng:2026.5.31-7159b8aed";
               networks = [ cfg.network ];
               ports = [ "127.0.0.1:8080:8080" ];
+              # Wrapper substitutes __SEARXNG_SECRET__ into the named-volume copy of
+              # settings.yml on first boot (generating a secret when SEARXNG_SECRET
+              # is unset), then hands off to the stock entrypoint. The repo template
+              # is mounted read-only straight from the Nix store, so the bind source
+              # always exists — a missing source would make Docker create it as a
+              # directory and the container would fail to start with exit 125.
+              entrypoint = "/bin/sh";
+              cmd = [
+                "-c"
+                ''
+                  set -eu
+                  if [ ! -s /etc/searxng/settings.yml ] || grep -q 'odysseus-local-searxng-json-2026-05-30\|__SEARXNG_SECRET__' /etc/searxng/settings.yml; then
+                    secret="''${SEARXNG_SECRET:-}"
+                    if [ -z "$secret" ]; then
+                      secret="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+                    fi
+                    sed "s|__SEARXNG_SECRET__|$secret|g" /tmp/searxng-settings.yml.template > /etc/searxng/settings.yml
+                  fi
+                  exec /usr/local/searxng/entrypoint.sh
+                ''
+              ];
               environment.SEARXNG_BASE_URL = "http://localhost:8080/";
               volumes = [
                 "searxng-data:/etc/searxng"
-                "${cfg.basePath}/config/searxng/settings.yml:/etc/searxng/settings.yml"
+                "${./config/searxng/settings.yml}:/tmp/searxng-settings.yml.template:ro"
+              ];
+              # The image runs as the non-root `searxng` user, but its entrypoint
+              # still needs to chown /etc/searxng on first boot, drop privs via
+              # su-exec, and write settings.yml into the named volume. Without these
+              # caps it aborts with EACCES. Mirrors upstream searxng-docker (issue #721).
+              extraOptions = [
+                "--cap-drop=ALL"
+                "--cap-add=CHOWN"
+                "--cap-add=SETGID"
+                "--cap-add=SETUID"
+                "--cap-add=DAC_OVERRIDE"
+                "--health-cmd=python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/', timeout=5).read(1)\""
+                "--health-interval=5s"
+                "--health-timeout=6s"
+                "--health-retries=20"
+                "--health-start-period=10s"
               ];
             };
 
