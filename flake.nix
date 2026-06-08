@@ -8,6 +8,13 @@
       let
         cfg = config.services.odysseus;
         docker = config.virtualisation.docker.package;
+        # searxng's settings template, exposed as a Nix-store *directory* (not a
+        # bare store file). Docker cannot prepare a bind-mount whose source is a
+        # single file in the read-only /nix/store — the container fails to start
+        # with exit 125. A store directory mounts cleanly, and writeTextDir keeps
+        # the "source always exists, immutable" guarantee. Read at the same path
+        # the cmd's sed expects: /tmp/searxng-template/settings.yml.
+        searxngSettingsDir = pkgs.writeTextDir "settings.yml" (builtins.readFile ./config/searxng/settings.yml);
       in {
         options.services.odysseus = {
           enable = lib.mkEnableOption "Odysseus self-hosted assistant stack";
@@ -131,9 +138,10 @@
               # Wrapper substitutes __SEARXNG_SECRET__ into the named-volume copy of
               # settings.yml on first boot (generating a secret when SEARXNG_SECRET
               # is unset), then hands off to the stock entrypoint. The repo template
-              # is mounted read-only straight from the Nix store, so the bind source
-              # always exists — a missing source would make Docker create it as a
-              # directory and the container would fail to start with exit 125.
+              # is mounted read-only as a Nix-store directory (see searxngSettingsDir):
+              # mounting it as a single store file makes Docker fail to start the
+              # container (exit 125), since it can't prepare a file bind source on
+              # the read-only store.
               entrypoint = "/bin/sh";
               cmd = [
                 "-c"
@@ -144,7 +152,7 @@
                     if [ -z "$secret" ]; then
                       secret="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
                     fi
-                    sed "s|__SEARXNG_SECRET__|$secret|g" /tmp/searxng-settings.yml.template > /etc/searxng/settings.yml
+                    sed "s|__SEARXNG_SECRET__|$secret|g" /tmp/searxng-template/settings.yml > /etc/searxng/settings.yml
                   fi
                   exec /usr/local/searxng/entrypoint.sh
                 ''
@@ -152,7 +160,7 @@
               environment.SEARXNG_BASE_URL = "http://localhost:8080/";
               volumes = [
                 "searxng-data:/etc/searxng"
-                "${./config/searxng/settings.yml}:/tmp/searxng-settings.yml.template:ro"
+                "${searxngSettingsDir}:/tmp/searxng-template:ro"
               ];
               # The image runs as the non-root `searxng` user, but its entrypoint
               # still needs to chown /etc/searxng on first boot, drop privs via
