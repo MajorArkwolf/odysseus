@@ -32,15 +32,28 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # Copy app code
 COPY . .
 
-# Create data directory (mount a volume here for persistence)
-RUN mkdir -p data logs services/cache/search
+# Bake the runtime user into the image so it can be started directly with
+# `docker run --user $PUID:$PGID` (how the NixOS module launches it) with no
+# root entrypoint step. Create a matching `odysseus` user/group and chown the
+# whole /app tree to it at build time — the app writes inside its own source
+# tree at runtime (services/cache, *.json, *.log), which would otherwise be
+# root-owned and crash a non-root run on the first mkdir.
+#
+# Defaults stay 1000:1000 for `docker compose` users on desktop distros (where
+# 1000 is the login user); the NixOS module overrides them via --build-arg.
+# When started as root (compose), entrypoint.sh still self-drops to PUID/PGID.
+ARG PUID=1000
+ARG PGID=1000
+RUN mkdir -p data logs services/cache/search \
+    && (getent group "$PGID" >/dev/null || groupadd -g "$PGID" odysseus) \
+    && (getent passwd "$PUID" >/dev/null || useradd -u "$PUID" -g "$PGID" -M -s /bin/sh -d /app odysseus) \
+    && chown -R "$PUID:$PGID" /app
 
-# Entrypoint that drops to PUID/PGID (default 1000:1000) and repairs
-# ownership on the bind-mounted /app/data and /app/logs. Without this,
-# the container runs as root and writes root-owned files into host
-# bind mounts — any later non-root run (or a host user trying to
-# update them) silently fails on EPERM, breaking skill extraction,
-# prefs persistence, mail attachments, etc.
+# Entrypoint that, when started as root, drops to PUID/PGID and repairs
+# ownership on the bind-mounted /app/data and /app/logs; when started as a
+# non-root user (--user), it skips straight to running the app. Without the
+# root path, a root-started container would write root-owned files into host
+# bind mounts and break skill extraction, prefs persistence, mail attachments.
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
