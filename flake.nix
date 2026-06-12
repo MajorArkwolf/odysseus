@@ -184,11 +184,18 @@
               # Run as the dedicated chromadb uid against a host bind mount whose
               # ownership is set by tmpfiles above (replacing the old named
               # volume `chromadb-data`).
+              #
+              # Mount at /data, NOT /chroma/chroma: the current (Rust) chroma
+              # image persists to /data (it logs `persist_path: /data`). The old
+              # /chroma/chroma mount was silently unused — chroma wrote to the
+              # in-image /data instead, so nothing actually persisted across
+              # container recreates. With --user that root-owned /data is no
+              # longer writable, so we mount our 981-owned dir there directly.
               user = "${toString cfg.chromadbUid}:${toString cfg.chromadbUid}";
               networks = [ cfg.network ];
               ports = [ "8100:8000" ];
               environment.ANONYMIZED_TELEMETRY = "FALSE";
-              volumes = [ "${cfg.basePath}/chromadb:/chroma/chroma" ];
+              volumes = [ "${cfg.basePath}/chromadb:/data" ];
             };
 
             searxng = {
