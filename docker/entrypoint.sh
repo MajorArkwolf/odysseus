@@ -11,55 +11,92 @@ set -e
 
 PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
+GOSU_BIN="$(command -v gosu)"
+PYTHON_BIN="$(command -v python)"
 
-# Two launch modes:
-#
-#   root  — `docker compose` on a desktop distro starts the container as root.
-#           We create a matching user/group, repair ownership on the writable
-#           paths, and drop to PUID:PGID via gosu at the end. This is the
-#           PUID/PGID footgun fix (root-owned files in host bind mounts).
-#
-#   user  — the NixOS module starts the container with `--user PUID:PGID`. The
-#           image was already built with a matching `odysseus` user owning /app
-#           (see Dockerfile), and the host bind mounts are pre-owned via
-#           tmpfiles, so none of the root-only steps below are needed — and
-#           useradd/chown/gosu would all fail with EPERM if attempted. Skip
-#           straight to running the app.
-#
-# The CUDA/vLLM/PATH setup further down runs in BOTH modes.
-if [ "$(id -u)" = "0" ]; then
-    # Reuse an existing matching group/user if the host's UID/GID already
-    # corresponds to one in /etc/passwd (e.g. when the image is rebuilt
-    # and "odysseus" already exists at the same id). Otherwise create.
-    if ! getent group "$PGID" >/dev/null 2>&1; then
-        groupadd -g "$PGID" odysseus
-    fi
-    if ! getent passwd "$PUID" >/dev/null 2>&1; then
-        useradd -u "$PUID" -g "$PGID" -M -s /bin/sh -d /app odysseus
-    fi
-
-    # Repair ownership on every writable path the app touches at runtime.
-    #
-    # Bind-mounted dirs (/app/data, /app/logs) are the obvious ones, but
-    # the app ALSO writes inside the image's own source tree at runtime:
-    #   - services/cache/{search,content}/*  (search cache LRU)
-    #   - services/search_analytics.json
-    #   - services/search_engine_error.log
-    #   - services/tts cache, etc.
-    # These dirs were created as root during `docker build`, so dropping
-    # to PUID:PGID would otherwise crash on the first import that tries
-    # to mkdir them. Chown the whole /app tree — fast (<1s on this size)
-    # and idempotent via the `-not -uid` filter so we only touch files
-    # that need fixing.
-    for dir in /app /app/data /app/logs; do
-        if [ -d "$dir" ]; then
-            # `find ... -not -uid` keeps this O(touched-files), not
-            # O(everything), so terabyte-sized maildirs don't slow startup.
-            find "$dir" -not -uid "$PUID" -print0 2>/dev/null \
-                | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null || true
-        fi
-    done
+# Reuse an existing matching group/user if the host's UID/GID already
+# corresponds to one in /etc/passwd (e.g. when the image is rebuilt
+# and "odysseus" already exists at the same id). Otherwise create.
+if ! getent group "$PGID" >/dev/null 2>&1; then
+    groupadd -g "$PGID" odysseus
 fi
+if ! getent passwd "$PUID" >/dev/null 2>&1; then
+    useradd -u "$PUID" -g "$PGID" -M -s /bin/sh -d /app odysseus
+fi
+
+ODY_USER="$(getent passwd "$PUID" | cut -d: -f1)"
+[ -z "$ODY_USER" ] && ODY_USER=odysseus
+
+# Docker-socket group plumbing. When /var/run/docker.sock is bind-mounted
+# (Cookbook uses docker exec to reach sibling containers), the socket is
+# owned by root:<host docker gid>. Add the app user to that group and later
+# call gosu by username so supplementary groups are retained.
+DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
+if [ -S "$DOCKER_SOCK" ]; then
+    SOCK_GID="$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo '')"
+    if [ -n "$SOCK_GID" ] && [ "$SOCK_GID" != "0" ]; then
+        if ! getent group "$SOCK_GID" >/dev/null 2>&1; then
+            groupadd -g "$SOCK_GID" docker_host || true
+        fi
+        SOCK_GROUP="$(getent group "$SOCK_GID" | cut -d: -f1)"
+        if [ -n "$SOCK_GROUP" ]; then
+            usermod -aG "$SOCK_GROUP" "$ODY_USER" 2>/dev/null || true
+        fi
+    fi
+fi
+
+mount_root_for() {
+    awk -v target="$1" '$5 == target { print $4; exit }' /proc/self/mountinfo 2>/dev/null || true
+}
+
+is_broad_mount_root() {
+    case "$1" in
+        /|/home|/srv|/var|/usr|/opt|/tmp|/mnt|/media)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+repair_tree_ownership() {
+    dir="$1"
+    if [ -d "$dir" ]; then
+        find "$dir" -xdev -not -uid "$PUID" -print0 2>/dev/null \
+            | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null || true
+    fi
+}
+
+repair_app_tree_ownership() {
+    if [ -d /app ]; then
+        find /app -xdev \
+            \( -path /app/data -o -path /app/logs -o -path /app/.ssh -o -path /app/.cache -o -path /app/.local \) -prune \
+            -o -not -uid "$PUID" -print0 2>/dev/null \
+            | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null || true
+    fi
+}
+
+repair_bind_mount_ownership() {
+    dir="$1"
+    if [ ! -d "$dir" ]; then
+        return
+    fi
+
+    mount_root="$(mount_root_for "$dir")"
+    if is_broad_mount_root "$mount_root"; then
+        echo "Skipping recursive ownership repair for $dir because it maps to broad host path $mount_root" >&2
+        chown "$PUID:$PGID" "$dir" 2>/dev/null || true
+        return
+    fi
+
+    repair_tree_ownership "$dir"
+}
+
+# Repair image-owned writable paths without walking into bind-mounted host
+# trees, then repair the app-owned mount roots separately.
+repair_app_tree_ownership
+for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local; do
+    repair_bind_mount_ownership "$dir"
+done
 
 # Cookbook installs vllm/etc. via `pip install --user`, which pulls
 # nvidia-cuda-* wheels into /app/.local but does not set CUDA_HOME or
@@ -85,6 +122,7 @@ for cu in \
         break
     fi
 done
+
 # Disable the FlashInfer JIT sampler unconditionally — it is sampler-only
 # and has no impact on the attention path, but requires nvcc + matching
 # CUDA headers at startup. Without this, vLLM crashes with "Could not find
@@ -95,15 +133,12 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 # vLLM and helper scripts land here because /app is the non-root user's HOME.
 export PATH="/app/.local/bin:$PATH"
 
-# Run first-time setup, then exec the app. When we started as root, do both via
-# gosu so data/ files get the right ownership and signals (SIGTERM from
-# `docker stop`) still reach uvicorn directly (gosu adds no extra shell layer,
-# unlike su/sudo). When started with --user we're already the app user, so run
-# in-process. setup.py is idempotent and `|| true` so it never blocks startup.
-if [ "$(id -u)" = "0" ]; then
-    gosu "$PUID:$PGID" python /app/setup.py || true
-    exec gosu "$PUID:$PGID" "$@"
-else
-    python /app/setup.py || true
-    exec "$@"
-fi
+# Run first-time setup as the app user so data/ files get the right ownership.
+# setup.py is idempotent — skips auth.json / .env if they already exist.
+# || true so a setup failure never prevents the container from starting.
+"$GOSU_BIN" "$ODY_USER" "$PYTHON_BIN" /app/setup.py || true
+
+# Drop root and run the actual app. `gosu` is preferred over `su` /
+# `sudo` because it cleans up the process tree (no extra shell layer)
+# so signals (SIGTERM from `docker stop`) reach uvicorn directly.
+exec "$GOSU_BIN" "$ODY_USER" "$@"
